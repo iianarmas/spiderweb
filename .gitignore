@@ -54,3 +54,6 @@ package-lock.json
 
 # OS
 Thumbs.db
+
+# Supabase
+supabase-schema.sql
