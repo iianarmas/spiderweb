@@ -1,21 +1,22 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   ScrollView,
   TextInput,
   Alert,
   ActivityIndicator,
   Image,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
 import Slider from '@react-native-community/slider';
 import { useRouter } from 'expo-router';
 import { supabase } from '../../../src/lib/supabase';
+import { ThreadPreview } from '../../../src/components/ThreadPreview';
 import { FrameShape, ThreadMode } from '../../../src/store/projectStore';
 import {
   prepareImage,
@@ -28,20 +29,40 @@ import {
 import { computeNailPositions, computeStringArt } from '../../../src/algorithm/stringArt';
 import { PRESET_PALETTES, ThreadColor } from '../../../src/algorithm/colorDecompose';
 import { buildColorLayers } from '../../../src/algorithm/colorDecompose';
+import { useTheme, ThemeColors } from '../../../src/theme';
 
 type WizardStep = 'frame' | 'image' | 'settings' | 'generate' | 'preview';
+const STEP_ORDER: WizardStep[] = ['frame', 'image', 'settings', 'generate', 'preview'];
+
+// Minimum nail spacing in mm before we warn the user
+const MIN_SPACING_MM = 5;
+
+function getNailSpacingMm(shape: FrameShape, widthCm: number, heightCm: number, nailCount: number): number {
+  const perimeterMm = shape === 'circle'
+    ? Math.PI * widthCm * 10
+    : 2 * (widthCm + heightCm) * 10;
+  return perimeterMm / nailCount;
+}
+
+function maxNailsForFrame(shape: FrameShape, widthCm: number, heightCm: number): number {
+  const perimeterMm = shape === 'circle'
+    ? Math.PI * widthCm * 10
+    : 2 * (widthCm + heightCm) * 10;
+  return Math.floor(perimeterMm / MIN_SPACING_MM);
+}
 
 export default function NewProjectScreen() {
   const router = useRouter();
+  const colors = useTheme();
 
   // Wizard state
   const [step, setStep] = useState<WizardStep>('frame');
 
   // Frame setup
   const [frameShape, setFrameShape] = useState<FrameShape>('circle');
-  const [frameDiameter, setFrameDiameter] = useState('30'); // cm (circle)
-  const [frameWidth, setFrameWidth] = useState('30');       // cm (rect/square)
-  const [frameHeight, setFrameHeight] = useState('30');     // cm
+  const [frameDiameter, setFrameDiameter] = useState('30');
+  const [frameWidth, setFrameWidth] = useState('30');
+  const [frameHeight, setFrameHeight] = useState('30');
 
   // Image
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -60,16 +81,33 @@ export default function NewProjectScreen() {
   const [progress, setProgress] = useState(0);
   const [nailSequence, setNailSequence] = useState<number[] | null>(null);
   const [colorLayers, setColorLayers] = useState<{ color: string; nailSequence: number[] }[] | null>(null);
+  const [nailPositions, setNailPositions] = useState<import('../../../src/algorithm/stringArt').NailPosition[]>([]);
 
   // Saving
   const [saving, setSaving] = useState(false);
 
-  // Computed pixels (kept across generate calls)
   const pixelsRef = useRef<Uint8ClampedArray | null>(null);
+
+  const styles = useMemo(() => makeStyles(colors), [colors]);
+
+  // Compute current frame dimensions in cm
+  const widthCm = frameShape === 'circle' ? parseFloat(frameDiameter) || 30 : parseFloat(frameWidth) || 30;
+  const heightCm = frameShape === 'circle' ? parseFloat(frameDiameter) || 30 : parseFloat(frameHeight) || 30;
+
+  function handleBack() {
+    const idx = STEP_ORDER.indexOf(step);
+    if (idx <= 0) {
+      router.replace('/(app)');
+    } else {
+      // Skip generate step when going back (it's a transient state)
+      const prevStep = STEP_ORDER[idx - 1];
+      setStep(prevStep === 'generate' ? 'settings' : prevStep);
+    }
+  }
 
   async function handlePickImage() {
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: 'images',
       allowsEditing: true,
       aspect: [1, 1],
       quality: 1,
@@ -101,12 +139,8 @@ export default function NewProjectScreen() {
       return;
     }
 
-    // Compute recommendations based on frame dimensions and image edge density
     try {
-      const widthCm = frameShape === 'circle' ? parseFloat(frameDiameter) : parseFloat(frameWidth);
-      const heightCm = frameShape === 'circle' ? parseFloat(frameDiameter) : parseFloat(frameHeight);
       const perimeter = computePerimeter(frameShape, widthCm, heightCm);
-
       const { pixels, size } = await prepareImage(imageUri, frameShape);
       pixelsRef.current = pixels;
       const gray = toGrayscale(pixels, size);
@@ -140,6 +174,7 @@ export default function NewProjectScreen() {
       }
 
       const nails = computeNailPositions(frameShape, nailCount);
+      setNailPositions(nails);
       const gray = toGrayscale(pixels, WORKING_SIZE);
 
       if (mode === 'bw') {
@@ -148,7 +183,6 @@ export default function NewProjectScreen() {
         });
         setNailSequence(sequence);
       } else {
-        // Color mode: run algorithm for each color layer
         const layers = buildColorLayers(pixels, WORKING_SIZE, selectedPalette);
         const results: { color: string; nailSequence: number[] }[] = [];
 
@@ -183,26 +217,29 @@ export default function NewProjectScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error('Not authenticated');
 
-      // Upload original image to Supabase Storage
+      // Upload original image using ImageManipulator for reliable base64 reading
       let originalImageUrl: string | null = null;
       if (imageUri) {
-        const ext = imageUri.split('.').pop() ?? 'jpg';
-        const filename = `${user.id}/${Date.now()}.${ext}`;
-        const response = await fetch(imageUri);
-        const blob = await response.blob();
+        const resized = await ImageManipulator.manipulateAsync(
+          imageUri,
+          [{ resize: { width: 1200, height: 1200 } }],
+          { format: ImageManipulator.SaveFormat.JPEG, compress: 0.85, base64: true },
+        );
+        if (!resized?.base64) throw new Error('Could not read image data for upload');
+
+        const filename = `${user.id}/${Date.now()}.jpg`;
+        const bytes = Uint8Array.from(atob(resized.base64), (c) => c.charCodeAt(0));
         const { error: uploadError } = await supabase.storage
           .from('project-images')
-          .upload(filename, blob, { contentType: `image/${ext}` });
+          .upload(filename, bytes, { contentType: 'image/jpeg' });
+
         if (!uploadError) {
-          const { data: { publicUrl } } = supabase.storage
+          const { data: urlData } = supabase.storage
             .from('project-images')
             .getPublicUrl(filename);
-          originalImageUrl = publicUrl;
+          originalImageUrl = urlData?.publicUrl ?? null;
         }
       }
-
-      const widthCm = frameShape === 'circle' ? parseFloat(frameDiameter) : parseFloat(frameWidth);
-      const heightCm = frameShape === 'circle' ? parseFloat(frameDiameter) : parseFloat(frameHeight);
 
       const { data, error } = await supabase
         .from('projects')
@@ -234,83 +271,116 @@ export default function NewProjectScreen() {
 
   // ---- Render ----
 
+  const stepIdx = STEP_ORDER.indexOf(step);
+  const showBackInHeader = step !== 'generate';
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()}>
-          <Text style={styles.back}>← Back</Text>
-        </TouchableOpacity>
+        {showBackInHeader ? (
+          <TouchableOpacity onPress={handleBack} style={styles.headerSide}>
+            <Text style={styles.back}>{stepIdx <= 0 ? 'Cancel' : '← Back'}</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.headerSide} />
+        )}
         <Text style={styles.headerTitle}>New Project</Text>
-        <View style={{ width: 60 }} />
+        <TouchableOpacity onPress={() => router.replace('/(app)')} style={styles.headerSide}>
+          <Text style={styles.homeBtn}>Home</Text>
+        </TouchableOpacity>
       </View>
 
       {/* Step indicator */}
       <View style={styles.stepRow}>
-        {(['frame', 'image', 'settings', 'generate', 'preview'] as WizardStep[]).map((s, i) => (
+        {STEP_ORDER.map((s, i) => (
           <View
             key={s}
             style={[
               styles.stepDot,
               step === s && styles.stepDotActive,
-              ['frame', 'image', 'settings', 'generate', 'preview'].indexOf(step) > i && styles.stepDotDone,
+              stepIdx > i && styles.stepDotDone,
             ]}
           />
         ))}
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
-        {step === 'frame' && <FrameStep
-          shape={frameShape} setShape={setFrameShape}
-          diameter={frameDiameter} setDiameter={setFrameDiameter}
-          width={frameWidth} setWidth={setFrameWidth}
-          height={frameHeight} setHeight={setFrameHeight}
-          onNext={() => setStep('image')}
-        />}
+        {step === 'frame' && (
+          <FrameStep
+            shape={frameShape} setShape={setFrameShape}
+            diameter={frameDiameter} setDiameter={setFrameDiameter}
+            width={frameWidth} setWidth={setFrameWidth}
+            height={frameHeight} setHeight={setFrameHeight}
+            onNext={() => setStep('image')}
+            colors={colors}
+            styles={styles}
+          />
+        )}
 
-        {step === 'image' && <ImageStep
-          imageUri={imageUri}
-          onPickGallery={handlePickImage}
-          onPickCamera={handleCameraImage}
-          onNext={handleProceedToSettings}
-          onBack={() => setStep('frame')}
-        />}
+        {step === 'image' && (
+          <ImageStep
+            imageUri={imageUri}
+            onPickGallery={handlePickImage}
+            onPickCamera={handleCameraImage}
+            onNext={handleProceedToSettings}
+            colors={colors}
+            styles={styles}
+          />
+        )}
 
-        {step === 'settings' && <SettingsStep
-          title={title} setTitle={setTitle}
-          mode={mode} setMode={setMode}
-          nailCount={nailCount} setNailCount={setNailCount}
-          stringCount={stringCount} setStringCount={setStringCount}
-          recommendedNails={recommendedNails}
-          recommendedStrings={recommendedStrings}
-          selectedPalette={selectedPalette}
-          setSelectedPalette={setSelectedPalette}
-          onNext={() => { setStep('generate'); handleGenerate(); }}
-          onBack={() => setStep('image')}
-        />}
+        {step === 'settings' && (
+          <SettingsStep
+            title={title} setTitle={setTitle}
+            mode={mode} setMode={setMode}
+            nailCount={nailCount} setNailCount={setNailCount}
+            stringCount={stringCount} setStringCount={setStringCount}
+            recommendedNails={recommendedNails}
+            recommendedStrings={recommendedStrings}
+            selectedPalette={selectedPalette}
+            setSelectedPalette={setSelectedPalette}
+            frameShape={frameShape}
+            widthCm={widthCm}
+            heightCm={heightCm}
+            onNext={() => { setStep('generate'); handleGenerate(); }}
+            colors={colors}
+            styles={styles}
+          />
+        )}
 
-        {step === 'generate' && <GenerateStep
-          progress={progress}
-          generating={generating}
-        />}
+        {step === 'generate' && (
+          <GenerateStep
+            progress={progress}
+            generating={generating}
+            colors={colors}
+            styles={styles}
+          />
+        )}
 
-        {step === 'preview' && <PreviewStep
-          imageUri={imageUri}
-          nailSequence={nailSequence}
-          colorLayers={colorLayers}
-          nailCount={nailCount}
-          stringCount={stringCount}
-          saving={saving}
-          onRegenerate={() => { setStep('generate'); handleGenerate(); }}
-          onSave={handleSave}
-        />}
+        {step === 'preview' && (
+          <PreviewStep
+            imageUri={imageUri}
+            nailSequence={nailSequence}
+            colorLayers={colorLayers}
+            nailPositions={nailPositions}
+            frameShape={frameShape}
+            nailCount={nailCount}
+            stringCount={stringCount}
+            saving={saving}
+            onRegenerate={() => { setStep('generate'); handleGenerate(); }}
+            onAdjust={() => setStep('settings')}
+            onSave={handleSave}
+            colors={colors}
+            styles={styles}
+          />
+        )}
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-// ---- Sub-components for each wizard step ----
+// ---- Sub-components ----
 
-function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, height, setHeight, onNext }: any) {
+function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, height, setHeight, onNext, colors, styles }: any) {
   return (
     <View>
       <Text style={styles.sectionTitle}>Step 1 — Frame Setup</Text>
@@ -338,7 +408,7 @@ function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, he
             value={diameter}
             onChangeText={setDiameter}
             placeholder="e.g. 30"
-            placeholderTextColor="#666"
+            placeholderTextColor={colors.placeholder}
           />
         </>
       )}
@@ -351,7 +421,7 @@ function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, he
             value={width}
             onChangeText={setWidth}
             placeholder="e.g. 30"
-            placeholderTextColor="#666"
+            placeholderTextColor={colors.placeholder}
           />
           {shape === 'rectangle' && (
             <>
@@ -362,7 +432,7 @@ function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, he
                 value={height}
                 onChangeText={setHeight}
                 placeholder="e.g. 40"
-                placeholderTextColor="#666"
+                placeholderTextColor={colors.placeholder}
               />
             </>
           )}
@@ -376,7 +446,7 @@ function FrameStep({ shape, setShape, diameter, setDiameter, width, setWidth, he
   );
 }
 
-function ImageStep({ imageUri, onPickGallery, onPickCamera, onNext, onBack }: any) {
+function ImageStep({ imageUri, onPickGallery, onPickCamera, onNext, colors, styles }: any) {
   return (
     <View>
       <Text style={styles.sectionTitle}>Step 2 — Choose Image</Text>
@@ -400,17 +470,33 @@ function ImageStep({ imageUri, onPickGallery, onPickCamera, onNext, onBack }: an
           Analyze & Next →
         </Text>
       </TouchableOpacity>
-      <TouchableOpacity style={styles.secondaryBtn} onPress={onBack}>
-        <Text style={styles.secondaryBtnText}>← Back</Text>
-      </TouchableOpacity>
     </View>
   );
 }
 
 function SettingsStep({
   title, setTitle, mode, setMode, nailCount, setNailCount, stringCount, setStringCount,
-  recommendedNails, recommendedStrings, selectedPalette, setSelectedPalette, onNext, onBack,
+  recommendedNails, recommendedStrings, selectedPalette, setSelectedPalette,
+  frameShape, widthCm, heightCm,
+  onNext, colors, styles,
 }: any) {
+  const spacingMm = getNailSpacingMm(frameShape, widthCm, heightCm, nailCount);
+  const maxNails = maxNailsForFrame(frameShape, widthCm, heightCm);
+  const nailsWontFit = nailCount > maxNails;
+
+  let fitLabel = '';
+  let fitColor = colors.success;
+  if (nailsWontFit) {
+    fitLabel = `Too tight! Nails won't fit (${spacingMm.toFixed(1)}mm spacing). Max ~${maxNails} nails for this frame.`;
+    fitColor = colors.danger;
+  } else if (spacingMm < 8) {
+    fitLabel = `Tight spacing (${spacingMm.toFixed(1)}mm). Precise nail placement needed.`;
+    fitColor = '#f59e0b';
+  } else {
+    fitLabel = `Good spacing (${spacingMm.toFixed(1)}mm between nails).`;
+    fitColor = colors.success;
+  }
+
   return (
     <View>
       <Text style={styles.sectionTitle}>Step 3 — Settings</Text>
@@ -421,7 +507,7 @@ function SettingsStep({
         value={title}
         onChangeText={setTitle}
         placeholder="e.g. Sunset Portrait"
-        placeholderTextColor="#666"
+        placeholderTextColor={colors.placeholder}
       />
 
       <Text style={styles.label}>Thread mode</Text>
@@ -458,7 +544,7 @@ function SettingsStep({
           <View style={styles.palettePreview}>
             {selectedPalette.map((c: ThreadColor) => (
               <View key={c.hex} style={styles.paletteChip}>
-                <View style={[styles.paletteColor, { backgroundColor: c.hex, borderWidth: c.hex === '#FFFFFF' ? 1 : 0 }]} />
+                <View style={[styles.paletteColor, { backgroundColor: c.hex, borderWidth: c.hex === '#FFFFFF' ? 1 : 0, borderColor: colors.border }]} />
                 <Text style={styles.paletteLabel}>{c.name}</Text>
               </View>
             ))}
@@ -477,10 +563,20 @@ function SettingsStep({
         step={10}
         value={nailCount}
         onValueChange={setNailCount}
-        minimumTrackTintColor="#7c4dff"
-        maximumTrackTintColor="#3a3a5a"
-        thumbTintColor="#7c4dff"
+        minimumTrackTintColor={colors.accent}
+        maximumTrackTintColor={colors.border}
+        thumbTintColor={colors.accent}
       />
+
+      {/* Nail fit indicator */}
+      <View style={[styles.fitBanner, { borderLeftColor: fitColor }]}>
+        <Text style={[styles.fitText, { color: fitColor }]}>{fitLabel}</Text>
+        {nailsWontFit && (
+          <Text style={[styles.fitText, { color: colors.subtext, marginTop: 4 }]}>
+            Increase frame size or reduce nail count.
+          </Text>
+        )}
+      </View>
 
       <Text style={styles.label}>
         Strings: <Text style={styles.valueLabel}>{stringCount}</Text>
@@ -493,9 +589,9 @@ function SettingsStep({
         step={100}
         value={stringCount}
         onValueChange={setStringCount}
-        minimumTrackTintColor="#7c4dff"
-        maximumTrackTintColor="#3a3a5a"
-        thumbTintColor="#7c4dff"
+        minimumTrackTintColor={colors.accent}
+        maximumTrackTintColor={colors.border}
+        thumbTintColor={colors.accent}
       />
 
       <View style={styles.tip}>
@@ -504,20 +600,21 @@ function SettingsStep({
         </Text>
       </View>
 
-      <TouchableOpacity style={styles.primaryBtn} onPress={onNext}>
+      <TouchableOpacity
+        style={[styles.primaryBtn, nailsWontFit && { opacity: 0.5 }]}
+        onPress={onNext}
+        disabled={nailsWontFit}
+      >
         <Text style={styles.primaryBtnText}>Generate →</Text>
-      </TouchableOpacity>
-      <TouchableOpacity style={styles.secondaryBtn} onPress={onBack}>
-        <Text style={styles.secondaryBtnText}>← Back</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
-function GenerateStep({ progress, generating }: any) {
+function GenerateStep({ progress, generating, colors, styles }: any) {
   return (
     <View style={styles.generateContainer}>
-      <ActivityIndicator size="large" color="#7c4dff" />
+      <ActivityIndicator size="large" color={colors.accent} />
       <Text style={styles.generateTitle}>Generating thread art…</Text>
       <View style={styles.progressBar}>
         <View style={[styles.progressFill, { width: `${progress}%` }]} />
@@ -530,136 +627,150 @@ function GenerateStep({ progress, generating }: any) {
   );
 }
 
-function PreviewStep({ imageUri, nailSequence, colorLayers, nailCount, stringCount, saving, onRegenerate, onSave }: any) {
+function PreviewStep({ imageUri, nailSequence, colorLayers, nailPositions, frameShape, nailCount, stringCount, saving, onRegenerate, onAdjust, onSave, colors, styles }: any) {
   const totalStrings = nailSequence ? nailSequence.length - 1 : colorLayers?.reduce((a: number, l: any) => a + l.nailSequence.length - 1, 0) ?? 0;
 
   return (
     <View>
-      <Text style={styles.sectionTitle}>Step 5 — Preview & Accuracy</Text>
+      <Text style={styles.sectionTitle}>Step 5 — Preview & Save</Text>
       <Text style={styles.previewInfo}>
         {totalStrings.toLocaleString()} strings computed across {nailCount} nails.
       </Text>
-      <View style={styles.previewPlaceholder}>
-        <Text style={styles.previewPlaceholderText}>
-          Thread art preview renders here{'\n'}(Skia canvas — see ThreadPreview component)
-        </Text>
-      </View>
+      <ThreadPreview
+        shape={frameShape}
+        nailPositions={nailPositions}
+        nailSequence={nailSequence}
+        colorLayers={colorLayers}
+        size={320}
+      />
       <Text style={styles.tip2}>
-        The preview above shows the exact strings you will make physically. If it looks good, save and start. If you want more detail, increase strings and regenerate.
+        The preview shows the exact strings you will make physically. Happy with it? Save and start. Need changes? Adjust settings or regenerate.
       </Text>
       <TouchableOpacity style={styles.primaryBtn} onPress={onSave} disabled={saving}>
         {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Save & Start Guiding →</Text>}
       </TouchableOpacity>
-      <TouchableOpacity style={styles.secondaryBtn} onPress={onRegenerate}>
-        <Text style={styles.secondaryBtnText}>Adjust & Regenerate</Text>
-      </TouchableOpacity>
+      <View style={styles.regenerateRow}>
+        <TouchableOpacity style={[styles.outlineBtn, { flex: 1 }]} onPress={onAdjust}>
+          <Text style={styles.outlineBtnText}>← Adjust Settings</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.outlineBtn, { flex: 1 }]} onPress={onRegenerate}>
+          <Text style={styles.outlineBtnText}>Regenerate</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#1a1a2e' },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#2a2a4a',
-  },
-  back: { color: '#b89eff', fontSize: 16, width: 60 },
-  headerTitle: { color: '#e0c9ff', fontSize: 18, fontWeight: '700' },
-  stepRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, paddingVertical: 14 },
-  stepDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#3a3a5a' },
-  stepDotActive: { backgroundColor: '#7c4dff', width: 20 },
-  stepDotDone: { backgroundColor: '#4a2aaa' },
-  scroll: { flex: 1 },
-  scrollContent: { padding: 20, paddingBottom: 60 },
-  sectionTitle: { fontSize: 20, fontWeight: '700', color: '#e0c9ff', marginBottom: 20 },
-  label: { color: '#9b8ab8', fontSize: 14, marginBottom: 6, marginTop: 12 },
-  valueLabel: { color: '#e0c9ff', fontWeight: '700' },
-  recommended: { color: '#7c4dff', fontSize: 12 },
-  input: {
-    backgroundColor: '#2a2a4a',
-    borderRadius: 10,
-    padding: 14,
-    color: '#fff',
-    fontSize: 16,
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-  },
-  segmentRow: { flexDirection: 'row', gap: 8, marginBottom: 4 },
-  segment: {
-    flex: 1,
-    padding: 12,
-    borderRadius: 10,
-    backgroundColor: '#2a2a4a',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-  },
-  segmentActive: { backgroundColor: '#3d2b6b', borderColor: '#7c4dff' },
-  segmentText: { color: '#9b8ab8', fontSize: 13, fontWeight: '600' },
-  segmentTextActive: { color: '#e0c9ff' },
-  imageRow: { flexDirection: 'row', gap: 12, marginBottom: 16 },
-  imageBtn: {
-    flex: 1,
-    backgroundColor: '#2a2a4a',
-    borderRadius: 14,
-    padding: 20,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-  },
-  imageBtnIcon: { fontSize: 32, marginBottom: 8 },
-  imageBtnText: { color: '#9b8ab8', fontSize: 14, fontWeight: '600' },
-  imagePreview: { width: '100%', aspectRatio: 1, borderRadius: 14, marginBottom: 20 },
-  primaryBtn: {
-    backgroundColor: '#7c4dff',
-    borderRadius: 12,
-    padding: 16,
-    alignItems: 'center',
-    marginTop: 20,
-  },
-  primaryBtnText: { color: '#fff', fontSize: 17, fontWeight: '700' },
-  secondaryBtn: {
-    padding: 14,
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  secondaryBtnText: { color: '#9b8ab8', fontSize: 15 },
-  tip: {
-    backgroundColor: '#1e1e3a',
-    borderRadius: 10,
-    padding: 12,
-    marginTop: 16,
-    borderLeftWidth: 3,
-    borderLeftColor: '#7c4dff',
-  },
-  tipText: { color: '#9b8ab8', fontSize: 13, lineHeight: 20 },
-  generateContainer: { alignItems: 'center', paddingTop: 60, gap: 20 },
-  generateTitle: { color: '#e0c9ff', fontSize: 22, fontWeight: '700' },
-  progressBar: { width: '100%', height: 8, backgroundColor: '#2a2a4a', borderRadius: 4, overflow: 'hidden' },
-  progressFill: { height: '100%', backgroundColor: '#7c4dff', borderRadius: 4 },
-  progressLabel: { color: '#9b8ab8', fontSize: 14 },
-  generateSubtext: { color: '#6a6a8a', fontSize: 13, textAlign: 'center', lineHeight: 20, paddingHorizontal: 20 },
-  previewInfo: { color: '#9b8ab8', fontSize: 14, marginBottom: 16 },
-  previewPlaceholder: {
-    width: '100%',
-    aspectRatio: 1,
-    backgroundColor: '#0d0d1a',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  previewPlaceholderText: { color: '#4a4a6a', textAlign: 'center', fontSize: 13, lineHeight: 22 },
-  tip2: { color: '#9b8ab8', fontSize: 13, lineHeight: 20, marginBottom: 8 },
-  palettePreview: { flexDirection: 'row', gap: 8, marginTop: 8, marginBottom: 4 },
-  paletteChip: { alignItems: 'center', gap: 4 },
-  paletteColor: { width: 28, height: 28, borderRadius: 14, borderColor: '#555' },
-  paletteLabel: { color: '#9b8ab8', fontSize: 10 },
-});
+// ---- Style factory ----
+
+function makeStyles(colors: ThemeColors) {
+  return StyleSheet.create({
+    container: { flex: 1, backgroundColor: colors.background },
+    header: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    },
+    headerSide: { width: 70 },
+    back: { color: colors.accentText, fontSize: 16 },
+    homeBtn: { color: colors.subtext, fontSize: 14, textAlign: 'right' },
+    headerTitle: { color: colors.text, fontSize: 18, fontWeight: '700' },
+    stepRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, paddingVertical: 14 },
+    stepDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.border },
+    stepDotActive: { backgroundColor: colors.accent, width: 20 },
+    stepDotDone: { backgroundColor: colors.accentMuted },
+    scroll: { flex: 1 },
+    scrollContent: { padding: 20, paddingBottom: 60 },
+    sectionTitle: { fontSize: 20, fontWeight: '700', color: colors.text, marginBottom: 20 },
+    label: { color: colors.subtext, fontSize: 14, marginBottom: 6, marginTop: 12 },
+    valueLabel: { color: colors.text, fontWeight: '700' },
+    recommended: { color: colors.accent, fontSize: 12 },
+    input: {
+      backgroundColor: colors.inputBg,
+      borderRadius: 10,
+      padding: 14,
+      color: colors.text,
+      fontSize: 16,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    segmentRow: { flexDirection: 'row', gap: 8, marginBottom: 4 },
+    segment: {
+      flex: 1,
+      padding: 12,
+      borderRadius: 10,
+      backgroundColor: colors.surface,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    segmentActive: { backgroundColor: colors.accentMuted, borderColor: colors.accent },
+    segmentText: { color: colors.subtext, fontSize: 13, fontWeight: '600' },
+    segmentTextActive: { color: colors.text },
+    imageRow: { flexDirection: 'row', gap: 12, marginBottom: 16 },
+    imageBtn: {
+      flex: 1,
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 20,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    imageBtnIcon: { fontSize: 32, marginBottom: 8 },
+    imageBtnText: { color: colors.subtext, fontSize: 14, fontWeight: '600' },
+    imagePreview: { width: '100%', aspectRatio: 1, borderRadius: 14, marginBottom: 20 },
+    primaryBtn: {
+      backgroundColor: colors.accent,
+      borderRadius: 12,
+      padding: 16,
+      alignItems: 'center',
+      marginTop: 20,
+    },
+    primaryBtnText: { color: '#fff', fontSize: 17, fontWeight: '700' },
+    outlineBtn: {
+      padding: 14,
+      alignItems: 'center',
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginTop: 10,
+    },
+    outlineBtnText: { color: colors.subtext, fontSize: 14, fontWeight: '600' },
+    regenerateRow: { flexDirection: 'row', gap: 10, marginTop: 4 },
+    tip: {
+      backgroundColor: colors.surfaceAlt,
+      borderRadius: 10,
+      padding: 12,
+      marginTop: 16,
+      borderLeftWidth: 3,
+      borderLeftColor: colors.accent,
+    },
+    tipText: { color: colors.subtext, fontSize: 13, lineHeight: 20 },
+    fitBanner: {
+      backgroundColor: colors.surfaceAlt,
+      borderRadius: 10,
+      padding: 10,
+      marginTop: 4,
+      marginBottom: 8,
+      borderLeftWidth: 3,
+    },
+    fitText: { fontSize: 13, lineHeight: 18 },
+    generateContainer: { alignItems: 'center', paddingTop: 60, gap: 20 },
+    generateTitle: { color: colors.text, fontSize: 22, fontWeight: '700' },
+    progressBar: { width: '100%', height: 8, backgroundColor: colors.surface, borderRadius: 4, overflow: 'hidden' },
+    progressFill: { height: '100%', backgroundColor: colors.accent, borderRadius: 4 },
+    progressLabel: { color: colors.subtext, fontSize: 14 },
+    generateSubtext: { color: colors.subtextMuted, fontSize: 13, textAlign: 'center', lineHeight: 20, paddingHorizontal: 20 },
+    previewInfo: { color: colors.subtext, fontSize: 14, marginBottom: 16 },
+    tip2: { color: colors.subtext, fontSize: 13, lineHeight: 20, marginBottom: 8, marginTop: 12 },
+    palettePreview: { flexDirection: 'row', gap: 8, marginTop: 8, marginBottom: 4 },
+    paletteChip: { alignItems: 'center', gap: 4 },
+    paletteColor: { width: 28, height: 28, borderRadius: 14 },
+    paletteLabel: { color: colors.subtext, fontSize: 10 },
+  });
+}

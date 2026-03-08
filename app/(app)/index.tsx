@@ -1,21 +1,24 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
   FlatList,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   Alert,
   ActivityIndicator,
   RefreshControl,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { supabase } from '../../src/lib/supabase';
 import { useProjectStore, Project } from '../../src/store/projectStore';
+import { useTheme, ThemeColors } from '../../src/theme';
 
 export default function HomeScreen() {
   const router = useRouter();
+  const colors = useTheme();
+  const styles = useMemo(() => makeStyles(colors), [colors]);
   const { projects, setProjects, setActiveProject } = useProjectStore();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -83,7 +86,7 @@ export default function HomeScreen() {
   if (loading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator size="large" color="#7c4dff" />
+        <ActivityIndicator size="large" color={colors.accent} />
       </View>
     );
   }
@@ -105,7 +108,7 @@ export default function HomeScreen() {
           <RefreshControl
             refreshing={refreshing}
             onRefresh={() => { setRefreshing(true); fetchProjects(); }}
-            tintColor="#7c4dff"
+            tintColor={colors.accent}
           />
         }
         ListEmptyComponent={
@@ -146,64 +149,66 @@ export default function HomeScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#1a1a2e' },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e' },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-  },
-  title: { fontSize: 24, fontWeight: '800', color: '#e0c9ff' },
-  signOut: { color: '#9b8ab8', fontSize: 14 },
-  list: { padding: 16, paddingBottom: 100 },
-  empty: { alignItems: 'center', paddingTop: 80 },
-  emptyText: { color: '#e0c9ff', fontSize: 18, fontWeight: '700', marginBottom: 8 },
-  emptySubtext: { color: '#9b8ab8', fontSize: 14 },
-  card: {
-    backgroundColor: '#2a2a4a',
-    borderRadius: 16,
-    padding: 18,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-  },
-  cardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
-  cardTitle: { color: '#e0c9ff', fontSize: 17, fontWeight: '700', flex: 1 },
-  cardBadge: {
-    backgroundColor: '#3d2b6b',
-    color: '#b89eff',
-    fontSize: 12,
-    fontWeight: '700',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 8,
-  },
-  cardMeta: { color: '#9b8ab8', fontSize: 13, marginBottom: 10 },
-  progressRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  progressBar: {
-    flex: 1,
-    height: 6,
-    backgroundColor: '#3a3a5a',
-    borderRadius: 3,
-    overflow: 'hidden',
-  },
-  progressFill: { height: '100%', backgroundColor: '#7c4dff', borderRadius: 3 },
-  progressLabel: { color: '#9b8ab8', fontSize: 12, width: 90, textAlign: 'right' },
-  fab: {
-    position: 'absolute',
-    right: 24,
-    bottom: 32,
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: '#7c4dff',
-    justifyContent: 'center',
-    alignItems: 'center',
-    elevation: 6,
-  },
-  fabText: { color: '#fff', fontSize: 32, lineHeight: 36, fontWeight: '300' },
-});
+function makeStyles(colors: ThemeColors) {
+  return StyleSheet.create({
+    container: { flex: 1, backgroundColor: colors.background },
+    center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
+    header: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingHorizontal: 20,
+      paddingTop: 16,
+      paddingBottom: 8,
+    },
+    title: { fontSize: 24, fontWeight: '800', color: colors.text },
+    signOut: { color: colors.subtext, fontSize: 14 },
+    list: { padding: 16, paddingBottom: 100 },
+    empty: { alignItems: 'center', paddingTop: 80 },
+    emptyText: { color: colors.text, fontSize: 18, fontWeight: '700', marginBottom: 8 },
+    emptySubtext: { color: colors.subtext, fontSize: 14 },
+    card: {
+      backgroundColor: colors.surface,
+      borderRadius: 16,
+      padding: 18,
+      marginBottom: 14,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    cardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+    cardTitle: { color: colors.text, fontSize: 17, fontWeight: '700', flex: 1 },
+    cardBadge: {
+      backgroundColor: colors.accentMuted,
+      color: colors.accentText,
+      fontSize: 12,
+      fontWeight: '700',
+      paddingHorizontal: 8,
+      paddingVertical: 2,
+      borderRadius: 8,
+    },
+    cardMeta: { color: colors.subtext, fontSize: 13, marginBottom: 10 },
+    progressRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+    progressBar: {
+      flex: 1,
+      height: 6,
+      backgroundColor: colors.border,
+      borderRadius: 3,
+      overflow: 'hidden',
+    },
+    progressFill: { height: '100%', backgroundColor: colors.accent, borderRadius: 3 },
+    progressLabel: { color: colors.subtext, fontSize: 12, width: 90, textAlign: 'right' },
+    fab: {
+      position: 'absolute',
+      right: 24,
+      bottom: 32,
+      width: 60,
+      height: 60,
+      borderRadius: 30,
+      backgroundColor: colors.accent,
+      justifyContent: 'center',
+      alignItems: 'center',
+      elevation: 6,
+    },
+    fabText: { color: '#fff', fontSize: 32, lineHeight: 36, fontWeight: '300' },
+  });
+}

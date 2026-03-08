@@ -18,7 +18,8 @@ export async function prepareImage(
     { format: ImageManipulator.SaveFormat.PNG, base64: true },
   );
 
-  const base64 = resized.base64!;
+  const base64 = resized.base64;
+  if (!base64) throw new Error('Image processing failed: could not get base64 data from image');
   const pixels = base64ToRGBA(base64, WORKING_SIZE);
 
   // Apply circular mask for circle shape

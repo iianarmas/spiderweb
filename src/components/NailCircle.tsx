@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { Canvas, Circle, Line, vec, Rect, Text as SkiaText, useFont, Group, Paint } from '@shopify/react-native-skia';
+import { Canvas, Circle, Line, vec, Rect, Text as SkiaText, useFont, Group, Paint, Path, Skia } from '@shopify/react-native-skia';
 import { NailPosition } from '../algorithm/stringArt';
 import { FrameShape } from '../store/projectStore';
 
@@ -37,12 +37,18 @@ export function NailCircle({
     [nailPositions, drawSize, padding],
   );
 
-  // Only render a max of 500 completed lines for performance
-  const visibleCompleted = useMemo(() => {
-    if (completedPairs.length <= 500) return completedPairs;
-    const step = Math.ceil(completedPairs.length / 500);
-    return completedPairs.filter((_, i) => i % step === 0);
-  }, [completedPairs]);
+  const completedPath = useMemo(() => {
+    const p = Skia.Path.Make();
+    completedPairs.forEach(([from, to]) => {
+      const a = nailCoords[from];
+      const b = nailCoords[to];
+      if (a && b) {
+        p.moveTo(a.x, a.y);
+        p.lineTo(b.x, b.y);
+      }
+    });
+    return p;
+  }, [completedPairs, nailCoords]);
 
   const hasCurrentLine = currentFrom >= 0 && currentTo >= 0 &&
     currentFrom < nailCoords.length && currentTo < nailCoords.length;
@@ -75,20 +81,12 @@ export function NailCircle({
       )}
 
       {/* Completed strings (grey, thin) */}
-      {visibleCompleted.map(([from, to], i) => {
-        const a = nailCoords[from];
-        const b = nailCoords[to];
-        if (!a || !b) return null;
-        return (
-          <Line
-            key={`c-${i}`}
-            p1={vec(a.x, a.y)}
-            p2={vec(b.x, b.y)}
-            color={`rgba(160, 140, 200, ${STRING_OPACITY})`}
-            strokeWidth={0.5}
-          />
-        );
-      })}
+      <Path
+        path={completedPath}
+        color={`rgba(160, 140, 200, ${STRING_OPACITY})`}
+        style="stroke"
+        strokeWidth={0.5}
+      />
 
       {/* Current active string (bright) */}
       {hasCurrentLine && (
@@ -107,8 +105,8 @@ export function NailCircle({
         const color = isFrom
           ? '#2ecc71'
           : isTo
-          ? '#ff8c00'
-          : '#4a4a6a';
+            ? '#ff8c00'
+            : '#4a4a6a';
         const r = isFrom || isTo ? NAIL_RADIUS + 2 : NAIL_RADIUS;
         return (
           <Circle key={`n-${i}`} cx={coord.x} cy={coord.y} r={r} color={color} />

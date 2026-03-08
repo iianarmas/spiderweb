@@ -1,30 +1,37 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   ScrollView,
   Alert,
   ActivityIndicator,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { supabase } from '../../../../src/lib/supabase';
 import { useProjectStore, Project } from '../../../../src/store/projectStore';
 import { NailCircle } from '../../../../src/components/NailCircle';
 import { computeNailPositions } from '../../../../src/algorithm/stringArt';
 import { NailPosition } from '../../../../src/algorithm/stringArt';
+import { useTheme, ThemeColors } from '../../../../src/theme';
+import Voice, { SpeechResultsEvent, SpeechErrorEvent } from '@react-native-voice/voice';
+import * as Speech from 'expo-speech';
 
 export default function GuideScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
+  const colors = useTheme();
+  const styles = useMemo(() => makeStyles(colors), [colors]);
   const { activeProject, setActiveProject, updateActiveProjectStep } = useProjectStore();
 
   const [project, setProject] = useState<Project | null>(activeProject);
   const [loading, setLoading] = useState(!activeProject);
   const [saving, setSaving] = useState(false);
   const [nailPositions, setNailPositions] = useState<NailPosition[]>([]);
+  const [isListening, setIsListening] = useState(false);
+  const latestHandleDone = useRef<() => void>(() => { });
 
   useEffect(() => {
     if (!activeProject || activeProject.id !== id) {
@@ -76,7 +83,6 @@ export default function GuideScreen() {
     setLoading(false);
   }
 
-  // Get the current nail sequence (handles B&W and color modes)
   function getCurrentSequence(p: Project): number[] | null {
     if (p.mode === 'bw') return p.nailSequence;
     if (p.colorLayers && p.currentColorLayer < p.colorLayers.length) {
@@ -85,20 +91,17 @@ export default function GuideScreen() {
     return null;
   }
 
-  // Current and next nail indices
   function getCurrentNails(p: Project): { from: number; to: number } | null {
     const seq = getCurrentSequence(p);
     if (!seq || p.currentStep >= seq.length - 1) return null;
     return { from: seq[p.currentStep], to: seq[p.currentStep + 1] };
   }
 
-  // Total strings for current color layer (or B&W)
   function getTotalInCurrentPhase(p: Project): number {
     const seq = getCurrentSequence(p);
     return seq ? seq.length - 1 : 0;
   }
 
-  // History: last 5 completed steps
   function getRecentHistory(p: Project): { from: number; to: number }[] {
     const seq = getCurrentSequence(p);
     if (!seq || p.currentStep === 0) return [];
@@ -117,10 +120,8 @@ export default function GuideScreen() {
     let newStep = project.currentStep + 1;
     let newColorLayer = project.currentColorLayer;
 
-    // Check if current color layer is done
     if (project.mode === 'color' && newStep >= seq.length - 1) {
       if (newColorLayer + 1 < (project.colorLayers?.length ?? 0)) {
-        // Move to next color layer
         newColorLayer += 1;
         newStep = 0;
       }
@@ -135,7 +136,6 @@ export default function GuideScreen() {
     setActiveProject(updated);
     updateActiveProjectStep(newStep, newColorLayer);
 
-    // Auto-save to Supabase
     setSaving(true);
     await supabase
       .from('projects')
@@ -144,10 +144,53 @@ export default function GuideScreen() {
     setSaving(false);
   }, [project]);
 
+  useEffect(() => {
+    latestHandleDone.current = handleDone;
+  }, [handleDone]);
+
+  useEffect(() => {
+    Voice.onSpeechStart = () => setIsListening(true);
+    Voice.onSpeechEnd = () => setIsListening(false);
+    Voice.onSpeechError = (e: SpeechErrorEvent) => {
+      console.error(e.error);
+      setIsListening(false);
+    };
+    Voice.onSpeechResults = (e: SpeechResultsEvent) => {
+      const text = e.value?.join(' ').toLowerCase() || '';
+      if (text.includes('next') || text.includes('done') || text.includes('yes')) {
+        latestHandleDone.current();
+        setTimeout(() => {
+          startListening();
+        }, 500);
+      }
+    };
+    return () => {
+      Voice.destroy().then(Voice.removeAllListeners);
+    };
+  }, []);
+
+  const startListening = async () => {
+    try {
+      await Voice.start('en-US');
+      setIsListening(true);
+    } catch (e) {
+      console.error('Failed to start listening', e);
+    }
+  };
+
+  const stopListening = async () => {
+    try {
+      await Voice.stop();
+      setIsListening(false);
+    } catch (e) {
+      console.error('Failed to stop listening', e);
+    }
+  };
+
   if (loading || !project) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator size="large" color="#7c4dff" />
+        <ActivityIndicator size="large" color={colors.accent} />
       </View>
     );
   }
@@ -157,6 +200,18 @@ export default function GuideScreen() {
   const history = getRecentHistory(project);
   const seq = getCurrentSequence(project);
   const isCompleted = !currentNails;
+
+  useEffect(() => {
+    if (isCompleted && isListening) {
+      stopListening();
+    }
+  }, [isCompleted, isListening]);
+
+  useEffect(() => {
+    if (currentNails) {
+      Speech.speak(`${currentNails.to + 1}`);
+    }
+  }, [project.currentStep]);
 
   const phaseName = project.mode === 'color' && project.colorLayers
     ? project.colorLayers[project.currentColorLayer]?.color ?? ''
@@ -172,14 +227,16 @@ export default function GuideScreen() {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()}>
-          <Text style={styles.back}>← Back</Text>
+        <TouchableOpacity onPress={() => router.push(`/(app)/project/${id}`)}>
+          <Text style={styles.back}>← Project</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>{project.title}</Text>
         {saving ? (
-          <ActivityIndicator size="small" color="#7c4dff" style={{ width: 60 }} />
+          <ActivityIndicator size="small" color={colors.accent} style={{ width: 70 }} />
         ) : (
-          <Text style={styles.savedLabel}>Saved</Text>
+          <TouchableOpacity onPress={() => router.replace('/(app)')} style={{ width: 70, alignItems: 'flex-end' }}>
+            <Text style={styles.homeBtn}>Home</Text>
+          </TouchableOpacity>
         )}
       </View>
 
@@ -256,9 +313,17 @@ export default function GuideScreen() {
             </View>
 
             {/* Done button */}
-            <TouchableOpacity style={styles.doneBtn} onPress={handleDone}>
-              <Text style={styles.doneBtnText}>Done — Next Step →</Text>
-            </TouchableOpacity>
+            <View style={styles.actionRow}>
+              <TouchableOpacity style={styles.doneBtn} onPress={handleDone}>
+                <Text style={styles.doneBtnText}>Done — Next Step →</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.micBtn, isListening && styles.micBtnActive]}
+                onPress={isListening ? stopListening : startListening}
+              >
+                <Text style={styles.micIcon}>{isListening ? '🎙️' : '🎤'}</Text>
+              </TouchableOpacity>
+            </View>
           </>
         )}
 
@@ -281,83 +346,100 @@ export default function GuideScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#1a1a2e' },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e' },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#2a2a4a',
-  },
-  back: { color: '#b89eff', fontSize: 16, width: 60 },
-  headerTitle: { color: '#e0c9ff', fontSize: 17, fontWeight: '700', flex: 1, textAlign: 'center' },
-  savedLabel: { color: '#4caf50', fontSize: 12, width: 60, textAlign: 'right' },
-  phaseBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#2a2a4a',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#3a3a5a',
-  },
-  phaseText: { color: '#9b8ab8', fontSize: 13 },
-  phaseColorDot: { width: 12, height: 12, borderRadius: 6, marginRight: 4 },
-  phaseColorName: { color: '#9b8ab8', fontSize: 13 },
-  scroll: { flex: 1 },
-  scrollContent: { padding: 20, gap: 16, paddingBottom: 40 },
-  diagramContainer: { alignItems: 'center' },
-  instructionBox: {
-    backgroundColor: '#2a2a4a',
-    borderRadius: 16,
-    padding: 20,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#3a3a5a',
-    gap: 12,
-  },
-  instructionLabel: { color: '#9b8ab8', fontSize: 15 },
-  nailRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
-  nailBadgeFrom: {
-    backgroundColor: '#1e4d3a',
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderWidth: 2,
-    borderColor: '#2ecc71',
-  },
-  nailBadgeTo: {
-    backgroundColor: '#4d1e00',
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderWidth: 2,
-    borderColor: '#ff8c00',
-  },
-  nailBadgeText: { color: '#fff', fontSize: 20, fontWeight: '800' },
-  arrow: { color: '#9b8ab8', fontSize: 28, fontWeight: '300' },
-  progressRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  progressBar: { flex: 1, height: 8, backgroundColor: '#2a2a4a', borderRadius: 4, overflow: 'hidden' },
-  progressFill: { height: '100%', backgroundColor: '#7c4dff', borderRadius: 4 },
-  progressLabel: { color: '#9b8ab8', fontSize: 13, width: 80, textAlign: 'right' },
-  doneBtn: {
-    backgroundColor: '#7c4dff',
-    borderRadius: 14,
-    padding: 20,
-    alignItems: 'center',
-    elevation: 4,
-  },
-  doneBtnText: { color: '#fff', fontSize: 20, fontWeight: '800' },
-  completedBox: { alignItems: 'center', padding: 40, gap: 16 },
-  completedEmoji: { fontSize: 64 },
-  completedTitle: { color: '#e0c9ff', fontSize: 20, fontWeight: '700', textAlign: 'center' },
-  historySection: { marginTop: 8 },
-  historyTitle: { color: '#6a6a8a', fontSize: 12, fontWeight: '700', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 },
-  historyRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 4 },
-  historyCheck: { color: '#4caf50', fontSize: 14 },
-  historyText: { color: '#6a6a8a', fontSize: 14 },
-});
+function makeStyles(colors: ThemeColors) {
+  return StyleSheet.create({
+    container: { flex: 1, backgroundColor: colors.background },
+    center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
+    header: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    },
+    back: { color: colors.accentText, fontSize: 16, width: 80 },
+    headerTitle: { color: colors.text, fontSize: 17, fontWeight: '700', flex: 1, textAlign: 'center' },
+    homeBtn: { color: colors.subtext, fontSize: 14 },
+    phaseBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: colors.surface,
+      paddingHorizontal: 16,
+      paddingVertical: 8,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    },
+    phaseText: { color: colors.subtext, fontSize: 13 },
+    phaseColorDot: { width: 12, height: 12, borderRadius: 6, marginRight: 4 },
+    phaseColorName: { color: colors.subtext, fontSize: 13 },
+    scroll: { flex: 1 },
+    scrollContent: { padding: 20, gap: 16, paddingBottom: 40 },
+    diagramContainer: { alignItems: 'center' },
+    instructionBox: {
+      backgroundColor: colors.surface,
+      borderRadius: 16,
+      padding: 20,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+      gap: 12,
+    },
+    instructionLabel: { color: colors.subtext, fontSize: 15 },
+    nailRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
+    nailBadgeFrom: {
+      backgroundColor: '#1e4d3a',
+      borderRadius: 10,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderWidth: 2,
+      borderColor: '#2ecc71',
+    },
+    nailBadgeTo: {
+      backgroundColor: '#4d1e00',
+      borderRadius: 10,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderWidth: 2,
+      borderColor: '#ff8c00',
+    },
+    nailBadgeText: { color: '#fff', fontSize: 20, fontWeight: '800' },
+    arrow: { color: colors.subtext, fontSize: 28, fontWeight: '300' },
+    progressRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+    progressBar: { flex: 1, height: 8, backgroundColor: colors.surface, borderRadius: 4, overflow: 'hidden' },
+    progressFill: { height: '100%', backgroundColor: colors.accent, borderRadius: 4 },
+    progressLabel: { color: colors.subtext, fontSize: 13, width: 80, textAlign: 'right' },
+    actionRow: { flexDirection: 'row', alignItems: 'center', gap: 12, width: '100%' },
+    doneBtn: {
+      flex: 1,
+      backgroundColor: colors.accent,
+      borderRadius: 14,
+      padding: 20,
+      alignItems: 'center',
+      elevation: 4,
+    },
+    doneBtnText: { color: '#fff', fontSize: 20, fontWeight: '800' },
+    micBtn: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 20,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    micBtnActive: {
+      backgroundColor: 'rgba(255, 140, 0, 0.1)',
+      borderColor: '#ff8c00',
+    },
+    micIcon: { fontSize: 20 },
+    completedBox: { alignItems: 'center', padding: 40, gap: 16 },
+    completedEmoji: { fontSize: 64 },
+    completedTitle: { color: colors.text, fontSize: 20, fontWeight: '700', textAlign: 'center' },
+    historySection: { marginTop: 8 },
+    historyTitle: { color: colors.subtextMuted, fontSize: 12, fontWeight: '700', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 },
+    historyRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 4 },
+    historyCheck: { color: colors.success, fontSize: 14 },
+    historyText: { color: colors.subtextMuted, fontSize: 14 },
+  });
+}
